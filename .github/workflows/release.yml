@@ -1,0 +1,157 @@
+name: GoodSoftware
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+
+
+permissions:
+  contents: write
+
+env:
+  APP_NAME: "YourAppName"
+  APK_URL: "https://your.app/download/url.apk"
+
+jobs:
+  check-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download APK
+        run: |
+          mkdir -p download
+          curl -L -o download/app.apk "$APK_URL"
+
+      - name: Calculate SHA256 hash
+        id: hash
+        run: |
+          NEW_HASH=$(sha256sum download/app.apk | awk '{print $1}')
+          echo "new_hash=$NEW_HASH" >> $GITHUB_OUTPUT
+          echo "New hash: $NEW_HASH"
+
+      - name: Read last hash (if exists)
+        id: last_hash
+        run: |
+          if [ -f last_hash.txt ]; then
+            LAST_HASH=$(cat last_hash.txt)
+          else
+            LAST_HASH=""
+          fi
+          echo "last_hash=$LAST_HASH" >> $GITHUB_OUTPUT
+          echo "Last hash: $LAST_HASH"
+
+      - name: Compare hashes
+        id: compare
+        run: |
+          if [ "${{ steps.hash.outputs.new_hash }}" == "${{ steps.last_hash.outputs.last_hash }}" ]; then
+            echo "No update detected. Exiting."
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Update detected. Will create a new release."
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install aapt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aapt
+
+      - name: Extract APK version
+        id: version
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          VERSION_NAME=$(aapt dump badging download/app.apk | grep "versionName" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          if [ -z "$VERSION_NAME" ]; then
+            echo "Warning: Unable to extract version number, use timestamp as tag"
+            VERSION_NAME="unknown-$(date +%Y%m%d%H%M%S)"
+          fi
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION_NAME"
+
+      - name: Update history.csv and Generate docs/index.md
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          NEW_HASH: ${{ steps.hash.outputs.new_hash }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          mkdir -p docs
+          HISTORY=history.csv
+          DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          TAG="v${VERSION_NAME}"
+
+          if [ ! -f "$HISTORY" ]; then
+            echo "version,sha256,date,tag" > "$HISTORY"
+          fi
+
+          echo "${VERSION_NAME},${NEW_HASH},${DATE},${TAG}" >> "$HISTORY"
+
+          LATEST_LINE=$(tail -n 1 "$HISTORY")
+
+          {
+            echo "# ${APP_NAME} APK"
+            echo ""
+            echo "## Latest"
+            echo ""
+            LATEST_VERSION=$(echo "$LATEST_LINE" | cut -d, -f1)
+            LATEST_HASH=$(echo "$LATEST_LINE" | cut -d, -f2)
+            LATEST_DATE=$(echo "$LATEST_LINE" | cut -d, -f3)
+            LATEST_TAG=$(echo "$LATEST_LINE" | cut -d, -f4)
+
+            GITHUB_DOWNLOAD_URL=https://github.com/${REPO}/releases/download/${LATEST_TAG}/app.apk
+
+            echo "- **Version**: ${LATEST_VERSION}"
+            echo "- **Date**: ${LATEST_DATE}"
+            echo "- **SHA256**: \`${LATEST_HASH}\`"
+            echo "- **Download**:"
+            echo "  - Github: [${GITHUB_DOWNLOAD_URL}](${GITHUB_DOWNLOAD_URL})"
+            echo "  - Mirror 1 (gh-proxy): [https://gh-proxy.org/${GITHUB_DOWNLOAD_URL}](https://gh-proxy.org/${GITHUB_DOWNLOAD_URL})"
+            echo "  - Mirror 2 (axisnow): [https://axisnow.gh-proxy.org/${GITHUB_DOWNLOAD_URL}](https://axisnow.gh-proxy.org/${GITHUB_DOWNLOAD_URL})"
+            echo ""
+            echo "> [!WARNING]"
+            echo "> **Always check the SHA256 before installing.**"
+            echo "> "
+            echo "> If it does **NOT** match, **DO NOT INSTALL** — the file may be broken or changed by someone, which can steal your money or data."
+            echo ""
+            echo "## Version History"
+            echo ""
+            echo "| Version | SHA256 | Update Time | Download |"
+            echo "|---------|--------|-------------|----------|"
+
+            tail -n +2 "$HISTORY" | tac | while IFS=',' read -r ver sha date tag; do
+              URL="https://github.com/${REPO}/releases/download/${tag}/app.apk"
+              echo "| ${ver} | \`${sha}\` | ${date} | [Github](${URL}) <br> [Mirror 1 (gh-proxy)](https://gh-proxy.org/${URL}) <br> [Mirror 2 (axisnow)](https://axisnow.gh-proxy.org/${URL}) |"
+            done
+          } > docs/index.md
+
+
+      - name: Update last hash file and commit docs
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          echo "${{ steps.hash.outputs.new_hash }}" > last_hash.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_hash.txt history.csv docs/index.md
+          git commit -m "Update last hash to ${{ steps.hash.outputs.new_hash }}"
+          git push
+
+      - name: Create Release and upload APK
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+        run: |
+          TAG="v${VERSION_NAME}"
+          # If the tag already exists, delete the old release and tag first
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" download/app.apk \
+            --title "v${VERSION_NAME}" \
+            --notes "version: ${VERSION_NAME}" \
+            --latest
