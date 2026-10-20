@@ -26,7 +26,7 @@ jobs:
       - name: Download APK
         run: |
           mkdir -p download
-          curl -L -o download/app.apk "$APK_URL"
+          wget -O download/app.apk "$APK_URL"
 
       - name: Calculate SHA256 hash
         id: hash
